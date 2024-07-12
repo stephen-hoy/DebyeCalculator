@@ -1,3 +1,4 @@
+from itertools import combinations_with_replacement
 import os
 import tempfile
 from io import BytesIO
@@ -11,7 +12,7 @@ import pkg_resources
 import warnings
 from glob import glob
 from datetime import datetime, timezone
-from typing import Union, Tuple, Any, List, Type
+from typing import Dict, Union, Tuple, Any, List, Type
 from collections import namedtuple
 
 # Handle import of torch (prerequisite)
@@ -567,6 +568,108 @@ class DebyeCalculator:
             output.append(output_tuple)
 
         return output if len(output) > 1 else output[0]
+    
+    def partial_sq(
+        self,
+        structure_source: StructureSourceType,
+        radii: Union[List[float], float, None] = None,
+        keep_on_device: bool = False,
+    ) -> Union[Dict[Tuple, GrTuple], List[Dict[Tuple, GrTuple]]]:
+        """
+        Calculate the partial structure functions S_ab(Q) for the given atomic structure(s)
+
+        Parameters:
+            structure_source (StructureSourceType): Atomic structure source in XYZ/CIF format, ASE Atoms object, or as a tuple of (atomic_identities, atomic_positions).
+            radii (Union[List[float], float, None]): List/float of radii/radius of particle(s) to generate with parsed CIF.
+            keep_on_device (bool): Flag to keep the results on the class device. Default is False, and will return numpy arrays on CPU.
+
+        Returns:
+            Union[Dict[Tuple, GrTuple], List[Dict[Tuple, GrTuple]]]: Dict of GrTuples containing r-values and reduced pair distribution functions G(r) 
+            for each element pair, or a list of such dicts.
+            Keys are of the format (element_1, element_2), where each element is a chemical symbol string and the key order does not matter.
+
+        Raises:
+            TypeError: If the structure source is of an invalid type.
+            IOError: If there is an issue loading the structure from the specified file.
+            ValueError: If the file extension is not valid or when providing .cif data file, radii is not provided.
+        """
+        def compute_partial_sq(structure, element_1, element_2):
+            # Calculate distances and batch
+            if self.batch_size is None:
+                self.batch_size = self._max_batch_size
+            unique_elements, counts = np.unique(structure.elements, return_counts=True)
+            dists = pdist(structure.xyz).split(self.batch_size)
+            indices = structure.triu_indices.split(self.batch_size, dim=1)
+            inverse_indices = structure.unique_inverse.split(self.batch_size, dim=1)
+            
+            el1_idx=np.where(unique_elements==element_1)[0][0]
+            el2_idx=np.where(unique_elements==element_2)[0][0]
+
+            if self.profile:
+                self.profiler.time('Batching and Distances')
+
+            # Calculate scattering using Debye Equation
+            iq = torch.zeros((len(self.q))).to(device=self.device, dtype=torch.float32)
+            for d, inv_idx, idx in zip(dists, inverse_indices, indices):
+                mask = (d >= self.rthres) & (inv_idx[0]==el1_idx) & (inv_idx[1]==el2_idx)
+                occ_product = structure.occupancy[idx[0]] * structure.occupancy[idx[1]]
+                sinc = torch.sinc(d[mask] * self.q / torch.pi)
+                ffp = structure.unique_form_factors[inv_idx[0]] * structure.unique_form_factors[inv_idx[1]]
+                iq += torch.sum(occ_product.unsqueeze(-1)[mask] * ffp[mask] * sinc.permute(1,0), dim=0)
+
+            # Apply Debye-Weller Isotropic Atomic Displacement
+            if self.biso != 0.0:
+                iq *= torch.exp(-self.q.squeeze(-1).pow(2) * self.biso/(8*torch.pi**2))
+            
+            # Calculate partial weighting from concentrations and scattering lengths
+            counts = torch.from_numpy(counts).to(device=self.device)
+            compositional_fractions = counts / torch.sum(counts)
+            partial_form_avg_sq = compositional_fractions[el1_idx]*compositional_fractions[el2_idx]*structure.unique_form_factors[el1_idx]*structure.unique_form_factors[el2_idx]
+            rel_weight = structure.form_avg_sq/partial_form_avg_sq
+        
+            # Calculate S(Q) and F(Q)
+            sq = iq/structure.form_avg_sq/structure.size
+            
+            if self.profile:
+                self.profiler.time('Partial S(Q)')
+
+            return sq
+        
+        if self.profile:
+            self.profiler.reset()
+        
+        if not isinstance(structure_source, list):
+            structure_source = [structure_source]
+
+        structures = []
+        for i, item in enumerate(structure_source):
+            structure_output = self._initialise_structure(item, radii, disable_pbar = True)
+
+            if isinstance(structure_output, list):
+                structures.extend(structure_output)
+            else:
+                structures.append(structure_output)
+
+        if self.profile:
+            self.profiler.time('Setup structures and form factors')
+
+        output = []
+        for structure in structures:
+            partials_dict={}
+            unique_elements = np.unique(structure.elements)
+            for pair in combinations_with_replacement(unique_elements, 2):
+                output_tuple = GrTuple(self.q.squeeze(-1), compute_partial_sq(structure, pair[0], pair[1]))
+                if not keep_on_device:
+                    output_tuple = output_tuple._replace(
+                        q = output_tuple.q.cpu().numpy(),
+                        s = output_tuple.s.cpu().numpy()
+                    )
+                partials_dict[(pair[0], pair[1])] = output_tuple
+                if pair[0] != pair[1]:
+                    partials_dict[(pair[1], pair[0])] = output_tuple # Allow for arbitary key order
+            output.append(partials_dict)
+
+        return output if len(output) > 1 else output[0]
 
     def fq(
         self,
@@ -740,6 +843,113 @@ class DebyeCalculator:
                     g = output_tuple.g.cpu().numpy()
                 )
             output.append(output_tuple)
+
+        return output if len(output) > 1 else output[0]
+    
+    def partial_gr(
+        self,
+        structure_source: StructureSourceType,
+        radii: Union[List[float], float, None] = None,
+        keep_on_device: bool = False,
+    ) -> Union[Dict[Tuple, GrTuple], List[Dict[Tuple, GrTuple]]]:
+        """
+        Calculate the reduced partial pair distribution functions G_ab(r) for the given atomic structure(s).
+
+        Parameters:
+            structure_source (StructureSourceType): Atomic structure source in XYZ/CIF format, ASE Atoms object, or as a tuple of (atomic_identities, atomic_positions).
+            radii (Union[List[float], float, None]): List/float of radii/radius of particle(s) to generate with parsed CIF.
+            keep_on_device (bool): Flag to keep the results on the class device. Default is False, and will return numpy arrays on CPU.
+
+        Returns:
+            Union[Dict[Tuple, GrTuple], List[Dict[Tuple, GrTuple]]]: Dict of GrTuples containing r-values and reduced pair distribution functions G(r) 
+            for each element pair, or a list of such dicts.
+            Keys are of the format (element_1, element_2), where each element is a chemical symbol string and the key order does not matter.
+
+        Raises:
+            TypeError: If the structure source is of an invalid type.
+            IOError: If there is an issue loading the structure from the specified file.
+            ValueError: If the file extension is not valid or when providing .cif data file, radii is not provided.
+        """
+        def compute_partial_gr(structure, element_1, element_2):
+            # Calculate distances and batch
+            if self.batch_size is None:
+                self.batch_size = self._max_batch_size
+            unique_elements, counts = np.unique(structure.elements, return_counts=True)
+            dists = pdist(structure.xyz).split(self.batch_size)
+            indices = structure.triu_indices.split(self.batch_size, dim=1)
+            inverse_indices = structure.unique_inverse.split(self.batch_size, dim=1)
+            
+            el1_idx=np.where(unique_elements==element_1)[0][0]
+            el2_idx=np.where(unique_elements==element_2)[0][0]
+
+            if self.profile:
+                self.profiler.time('Batching and Distances')
+
+            # Calculate scattering using Debye Equation
+            iq = torch.zeros((len(self.q))).to(device=self.device, dtype=torch.float32)
+            for d, inv_idx, idx in zip(dists, inverse_indices, indices):
+                mask = (d >= self.rthres) & (inv_idx[0]==el1_idx) & (inv_idx[1]==el2_idx)
+                occ_product = structure.occupancy[idx[0]] * structure.occupancy[idx[1]]
+                sinc = torch.sinc(d[mask] * self.q / torch.pi)
+                ffp = structure.unique_form_factors[inv_idx[0]] * structure.unique_form_factors[inv_idx[1]]
+                iq += torch.sum(occ_product.unsqueeze(-1)[mask] * ffp[mask] * sinc.permute(1,0), dim=0)
+
+            # Apply Debye-Weller Isotropic Atomic Displacement
+            if self.biso != 0.0:
+                iq *= torch.exp(-self.q.squeeze(-1).pow(2) * self.biso/(8*torch.pi**2))
+            
+            # Calculate partial weighting from concentrations and scattering lengths
+            counts = torch.from_numpy(counts).to(device=self.device)
+            compositional_fractions = counts / torch.sum(counts)
+            partial_form_avg_sq = compositional_fractions[el1_idx]*compositional_fractions[el2_idx]*structure.unique_form_factors[el1_idx]*structure.unique_form_factors[el2_idx]
+            rel_weight = structure.form_avg_sq/partial_form_avg_sq
+        
+            # Calculate S(Q), F(Q) and G(r)
+            sq = iq/structure.form_avg_sq/structure.size * rel_weight
+            fq = self.q.squeeze(-1) * sq
+
+            damp = 1 if self.qdamp == 0.0 else torch.exp(-(self.r.squeeze(-1) * self.qdamp).pow(2) / 2)
+            lorch_mod = 1 if self.lorch_mod == None else torch.sinc(self.q * self.lorch_mod*(torch.pi / self.qmax))
+            gr = (2 / torch.pi) * torch.sum(fq.unsqueeze(-1) * torch.sin(self.q * self.r.permute(1,0))*self.qstep * lorch_mod, dim=0) * damp
+            
+            if self.profile:
+                self.profiler.time('Partial G(r)')
+            
+            return gr
+        
+        if self.profile:
+            self.profiler.reset()
+        
+        if not isinstance(structure_source, list):
+            structure_source = [structure_source]
+
+        structures = []
+        for i, item in enumerate(structure_source):
+            structure_output = self._initialise_structure(item, radii, disable_pbar = True)
+
+            if isinstance(structure_output, list):
+                structures.extend(structure_output)
+            else:
+                structures.append(structure_output)
+
+        if self.profile:
+            self.profiler.time('Setup structures and form factors')
+
+        output = []
+        for structure in structures:
+            partials_dict={}
+            unique_elements = np.unique(structure.elements)
+            for pair in combinations_with_replacement(unique_elements, 2):
+                output_tuple = GrTuple(self.r.squeeze(-1), compute_partial_gr(structure, pair[0], pair[1]))
+                if not keep_on_device:
+                    output_tuple = output_tuple._replace(
+                        r = output_tuple.r.cpu().numpy(),
+                        g = output_tuple.g.cpu().numpy()
+                    )
+                partials_dict[(pair[0], pair[1])] = output_tuple
+                if pair[0] != pair[1]:
+                    partials_dict[(pair[1], pair[0])] = output_tuple # Allow for arbitary key order
+            output.append(partials_dict)
 
         return output if len(output) > 1 else output[0]
 
