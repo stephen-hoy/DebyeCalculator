@@ -1,3 +1,12 @@
+# Fork Description
+This fork has been created to build in native support for partial S(q) and G(r) functions, including for unlike pairs (where the current structure masking method will calculate the A-A, B-B *and* A-B pairings, rather than the A-B pairing in isolation). If you have any questions about this fork, please feel free to contact me via my profile.
+
+**PLEASE NOTE**: The modifications made in this fork have not yet been tested against the included unit tests, nor have these unit tests been expanded to account for these new features. Use at your own risk!
+
+The original README for this project can be found below.
+
+---
+
 [![pypi](https://img.shields.io/pypi/v/Debyecalculator?label=pypi)](https://pypi.org/project/DebyeCalculator/)
 [![Python](https://img.shields.io/badge/python-%3E%3D3.7-blue)](https://www.python.org/downloads/)
 [![License](https://img.shields.io/github/license/FrederikLizakJohansen/DebyeCalculator)]([https://github.com/lfwa/carbontracker/blob/master/LICENSE](https://github.com/FrederikLizakJohansen/DebyeCalculator/blob/main/LICENSE.txt))
